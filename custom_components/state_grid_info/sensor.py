@@ -15,7 +15,7 @@ from homeassistant.const import CONF_NAME
 
 from .const import (
     DOMAIN,
-    DATA_SOURCE_HASSBOX, DATA_SOURCE_QINGLONG,
+    DATA_SOURCE_HASSBOX, DATA_SOURCE_QINGLONG, DATA_SOURCE_STATE_GRID_APP,
     BILLING_STANDARD_YEAR_阶梯, BILLING_STANDARD_YEAR_阶梯_峰平谷,
     BILLING_STANDARD_MONTH_阶梯, BILLING_STANDARD_MONTH_阶梯_峰平谷,
     BILLING_STANDARD_MONTH_阶梯_峰平谷_变动价格, BILLING_STANDARD_OTHER_平均单价,
@@ -28,9 +28,10 @@ from .const import (
     CONF_PRICE_PEAK, CONF_PRICE_FLAT, CONF_PRICE_VALLEY, CONF_PRICE_TIP,
     CONF_MONTH_PRICES, CONF_AVERAGE_PRICE, CONF_IS_PREPAID,
 )
-from .storage import StateGridStorage
+from .storage import StateGridStorage, _trim_consecutive_zero_days
 
 _LOGGER = logging.getLogger(__name__)
+
 
 async def async_setup_entry(
     hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
@@ -85,6 +86,9 @@ class StateGridInfoDataCoordinator(DataUpdateCoordinator):
         """Set up the data source based on configuration."""
         if self.config.get(CONF_DATA_SOURCE) == DATA_SOURCE_HASSBOX:
             # HassBox集成数据源不需要特殊设置
+            pass
+        elif self.config.get(CONF_DATA_SOURCE) == DATA_SOURCE_STATE_GRID_APP:
+            # 网上国网 App 集成数据源（读取 .storage/state_grid_app.config），不需要特殊设置
             pass
         elif self.config.get(CONF_DATA_SOURCE) == DATA_SOURCE_QINGLONG:
             # 设置MQTT客户端
@@ -258,6 +262,37 @@ class StateGridInfoDataCoordinator(DataUpdateCoordinator):
                 
                 return self.data
 
+            elif self.config.get(CONF_DATA_SOURCE) == DATA_SOURCE_STATE_GRID_APP:
+                # 每次都重新从文件读取最新数据
+                force_refresh = time_diff.total_seconds() > 600  # 10分钟
+                if force_refresh:
+                    _LOGGER.info("已超过10分钟未更新数据，强制刷新（网上国网 App）")
+
+                # 使用异步执行器运行文件读取操作
+                app_data = await self.hass.async_add_executor_job(self._fetch_app_data)
+
+                # 更新数据时间戳
+                self.last_update_time = current_time
+
+                # 清除过期标志
+                if isinstance(app_data, dict):
+                    app_data["data_expired"] = False
+
+                # 先更新到持久化存储，再读取到HA
+                if app_data:
+                    merged_data = await self.hass.async_add_executor_job(
+                        self._storage.update, app_data
+                    )
+                    self.data = merged_data
+                else:
+                    # 新数据为空时，使用持久化存储中的历史数据
+                    if self._storage.data.get("dayList"):
+                        self.data = dict(self._storage.data)
+                    else:
+                        self.data = app_data
+
+                return self.data
+
             elif self.config.get(CONF_DATA_SOURCE) == DATA_SOURCE_QINGLONG:
                 # 对于MQTT，检查连接状态并尝试重新连接
                 if not self.mqtt_client:
@@ -288,6 +323,61 @@ class StateGridInfoDataCoordinator(DataUpdateCoordinator):
 
     def _fetch_hassbox_data(self):
         """Fetch data from HassBox integration."""
+        return self._fetch_power_user_data("state_grid.config")
+
+    def _fetch_app_data(self):
+        """Fetch data from 网上国网 App integration.
+
+        优先读取 state_grid_app 集成运行时的内存数据（``hass.data["state_grid_app"]``），
+        它始终是最新且包含充值记录；若两者不在同一 HA 实例、内存数据不可用
+        （例如 state_grid_app 未加载），则回退到磁盘 ``.storage/state_grid_app.config``。
+        """
+        live = self._fetch_app_data_from_memory()
+        if live:
+            return live
+        return self._fetch_power_user_data("state_grid_app.config")
+
+    def _fetch_app_data_from_memory(self):
+        """从 state_grid_app 集成运行时的内存数据读取（同 HA 实例、数据最新鲜）。
+
+        直接复用其 StateGridAppDataClient.get_door_account() 返回的户号字典，
+        其中已包含 recharge_list；按配置的户号 / 索引取出对应户号后走与磁盘
+        路径完全一致的 _process_hassbox_data 归一化。
+        """
+        try:
+            app_client = self.hass.data.get("state_grid_app")
+            if app_client is None:
+                return {}
+            get_door = getattr(app_client, "get_door_account", None)
+            if get_door is None:
+                return {}
+            door_account = get_door()
+            if not isinstance(door_account, dict) or not door_account:
+                return {}
+            cons_no = self.config.get(CONF_CONSUMER_NUMBER)
+            # 优先按户号精确匹配（配置中选中的 consNo_dst）
+            if cons_no and cons_no in door_account:
+                return self._process_hassbox_data(door_account[cons_no])
+            # 否则按配置索引选取（与磁盘路径一致）
+            index = int(self.config.get(CONF_CONSUMER_NUMBER_INDEX, 0) or 0)
+            items = list(door_account.values())
+            if 0 <= index < len(items):
+                return self._process_hassbox_data(items[index])
+            if items:
+                return self._process_hassbox_data(items[0])
+        except Exception as ex:  # noqa: BLE001
+            _LOGGER.debug("从 state_grid_app 内存读取失败，回退磁盘: %s", ex)
+        return {}
+
+    def _fetch_power_user_data(self, storage_filename):
+        """从 state_grid 系列存储文件中读取并归一指定户号的数据。
+
+        storage_filename 为 .storage 下的文件名（state_grid.config /
+        state_grid_app.config）。两者均由 Home Assistant Store 写入，结构同构：
+        {"data": {"powerUserList": [...]，...]}，因此可复用同一套读取逻辑，
+        其中 state_grid_app.config 由 state_grid_app 集成写入，供本集成的
+        「网上国网App」数据源直接复用 _process_hassbox_data 处理。
+        """
         try:
             import os
             import time
@@ -298,8 +388,8 @@ class StateGridInfoDataCoordinator(DataUpdateCoordinator):
             random_param = random.randint(1, 100000)
             
             # 获取标准配置路径
-            config_path = self.hass.config.path(".storage", "state_grid.config")
-            _LOGGER.debug("尝试读取HassBox配置文件: %s (随机参数: %s)", config_path, random_param)
+            config_path = self.hass.config.path(".storage", storage_filename)
+            _LOGGER.debug("尝试读取国家电网配置文件: %s (随机参数: %s)", config_path, random_param)
             
             # 检查文件是否存在
             if os.path.exists(config_path):
@@ -311,7 +401,7 @@ class StateGridInfoDataCoordinator(DataUpdateCoordinator):
                     time_diff = now - file_mod_datetime
                     
                     _LOGGER.info(
-                        "HassBox配置文件存在，最后修改时间: %s (距现在 %.1f 小时)",
+                        "国家电网配置文件存在，最后修改时间: %s (距现在 %.1f 小时)",
                         file_mod_datetime.strftime("%Y-%m-%d %H:%M:%S"),
                         time_diff.total_seconds() / 3600
                     )
@@ -319,7 +409,7 @@ class StateGridInfoDataCoordinator(DataUpdateCoordinator):
                     # 如果文件超过24小时未更新，记录警告
                     if time_diff.total_seconds() > 86400:  # 24小时
                         _LOGGER.warning(
-                            "HassBox配置文件已超过24小时未更新，可能需要检查HassBox集成是否正常工作"
+                            "国家电网配置文件已超过24小时未更新，可能需要检查对应集成是否正常工作"
                         )
                 except Exception as time_err:
                     _LOGGER.warning("获取文件修改时间失败: %s", time_err)
@@ -339,7 +429,7 @@ class StateGridInfoDataCoordinator(DataUpdateCoordinator):
                         
                         # 检查文件内容是否为空
                         if not file_content.strip():
-                            _LOGGER.error("HassBox配置文件内容为空")
+                            _LOGGER.error("国家电网配置文件内容为空")
                             return {}
                         
                         # 解析JSON数据
@@ -392,7 +482,7 @@ class StateGridInfoDataCoordinator(DataUpdateCoordinator):
                 except Exception as read_err:
                     _LOGGER.error("读取文件错误: %s", read_err)
             else:
-                _LOGGER.error("HassBox配置文件不存在: %s", config_path)
+                _LOGGER.error("国家电网配置文件不存在: %s", config_path)
                 # 尝试列出目录内容
                 try:
                     storage_dir = self.hass.config.path(".storage")
@@ -409,7 +499,7 @@ class StateGridInfoDataCoordinator(DataUpdateCoordinator):
             
             return {}
         except Exception as ex:
-            _LOGGER.error("获取HassBox数据时发生错误: %s", ex)
+            _LOGGER.error("获取国家电网数据时发生错误: %s", ex)
             return {}
 
     def _process_hassbox_data(self, power_user_data):
@@ -507,24 +597,8 @@ class StateGridInfoDataCoordinator(DataUpdateCoordinator):
             # 计算每日电费
             dayList = self._calculate_daily_cost(daylist7)
 
-            # 删除尾部的连续全0数据
-            # 从后往前遍历，找到第一个非0的数据项
-            last_non_zero_index = len(dayList) - 1
-            while last_non_zero_index >= 0:
-                item = dayList[last_non_zero_index]
-                # 检查所有数值字段是否都为0
-                if (item.get("dayEleNum", 0) == 0 and
-                    item.get("dayEleCost", 0) == 0 and
-                    item.get("dayTPq", 0) == 0 and
-                    item.get("dayPPq", 0) == 0 and
-                    item.get("dayNPq", 0) == 0 and
-                    item.get("dayVPq", 0) == 0):
-                    last_non_zero_index -= 1
-                else:
-                    break
-            # 只保留到第一个非0数据项
-            if last_non_zero_index < len(dayList) - 1:
-                dayList = dayList[:last_non_zero_index + 1]
+            # 删除首尾连续的全0日数据（最新端与最旧端），保留中间有效区段
+            dayList = _trim_consecutive_zero_days(dayList)
 
             # 恢复原始数据
             self.data = original_data
@@ -557,6 +631,7 @@ class StateGridInfoDataCoordinator(DataUpdateCoordinator):
                 "dayList": dayList,
                 "monthList": monthList,
                 "yearList": yearList,
+                "rechargeList": power_user_data.get("recharge_list", []),
                 "consumer_name": power_user_data.get("consName_dst", ""),
             }
         except Exception as ex:
@@ -598,6 +673,9 @@ class StateGridInfoDataCoordinator(DataUpdateCoordinator):
             dayList = self._calculate_daily_cost(dayList7)
             dayList.reverse()  # 改为最新日期在前
 
+            # 删除首尾连续的全0日数据（与 hassbox / 网上国网 App 数据源保持一致）
+            dayList = _trim_consecutive_zero_days(dayList)
+
             # 恢复原始数据
             self.data = original_data
             
@@ -614,6 +692,7 @@ class StateGridInfoDataCoordinator(DataUpdateCoordinator):
                 "dayList": dayList,
                 "monthList": monthList,
                 "yearList": yearList,
+                "rechargeList": payload.get("recharge_list", []),
             }
         except Exception as ex:
             _LOGGER.error("Error processing Qinglong data: %s", ex)
@@ -1434,6 +1513,7 @@ class StateGridInfoSensor(SensorEntity):
                 "daylist": self.coordinator.data.get("dayList", []),
                 "monthlist": self.coordinator.data.get("monthList", []),
                 "yearlist": self.coordinator.data.get("yearList", []),
+                "rechargelist": self.coordinator.data.get("rechargeList", []),
             })
         
         # 添加计费标准配置
